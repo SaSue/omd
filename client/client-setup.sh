@@ -5,7 +5,7 @@ set -euo pipefail
 # === Einstellungen (kannst du auch per ENV überschreiben) ===
 NCPA_DIR="${NCPA_DIR:-/opt/ncpa-src}"
 VENV_DIR="${VENV_DIR:-/opt/ncpa-venv}"
-TOKEN="${NCPA_TOKEN:ecd006c7dae049c15ab74148343daca6a6e1b7755293a205a139104bb914f2fb}"
+TOKEN="${NCPA_TOKEN:-}"
 ALLOWED_HOSTS="${NCPA_ALLOWED_HOSTS:-127.0.0.1,192.168.1.0/24}"
 PORT="${NCPA_PORT:-5693}"
 
