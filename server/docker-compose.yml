@@ -1,1 +1,39 @@
+services:
+  omd:
+    build: .
+    container_name: omd
+    restart: unless-stopped
 
+    # Wichtig: Container soll NICHT mehr "demo" als Default starten
+    environment:
+      OMD_SITE: raspi
+      TZ: Europe/Berlin
+
+    # Nur intern erreichbar
+    networks:
+      - proxy-net
+
+    # Persistenz (wichtig!)
+    volumes:
+      - ./local:/omd/sites/demo/local.mount
+      - ./etc:/omd/sites/demo/etc.mount
+      - ./var:/omd/sites/demo/var.mount
+
+      - omd_ansible:/root/ansible_dropin
+
+    # Optional: schneller Check ob Apache intern da ist (443)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --no-check-certificate https://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+networks:
+  proxy-net:
+    external: true
+
+volumes:
+  omd_local:
+  omd_etc:
+  omd_var:
+  omd_ansible:
