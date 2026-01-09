@@ -105,7 +105,7 @@ sudo sed -i -E "s|^#?\s*ssl_version\s*=.*|ssl_version = ${NCPA_SSL_VERSION}|g" "
 sudo sed -i -E \
   -e 's|^#?\s*uid\s*=.*|uid = root|' \
   -e 's|^#?\s*gid\s*=.*|gid = root|' \
-  /opt/ncpa-src/agent/etc/ncpa.cfg
+  "${NCPA_CFG}" 
 
 echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
