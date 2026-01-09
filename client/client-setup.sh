@@ -38,7 +38,7 @@ sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends \
   ca-certificates curl jq git \
   python3 python3-venv python3-pip \
-  nagios-plugins-contrib
+  nagios-plugins-contrib nagios-plugins
 
 echo "[*] Ensuring NCPA source exists at ${NCPA_SRC} ..."
 if [[ ! -d "${NCPA_SRC}/.git" ]]; then
