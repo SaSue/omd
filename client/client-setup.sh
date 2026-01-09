@@ -174,7 +174,7 @@ EOF
 
 # --- check_docker_swarm_services (fixed: no history false positives) ---
 sudo tee "${NCPA_PLUGINS}/check_docker_swarm_services" >/dev/null <<'EOF'
-sudo tee /opt/ncpa-src/agent/plugins/check_docker_swarm_services >/dev/null <<'EOF'
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -258,8 +258,121 @@ echo "OK - swarm services healthy (checked=${checked}, ignored=${ignored})"
 exit 0
 EOF
 
+sudo tee "/${NCPA_PLUGINS}/check_ssl_cert_expiry" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check_ssl_cert_expiry
+# Modes:
+#   FILE  : check_ssl_cert_expiry -f /path/to/fullchain.pem [-w DAYS] [-c DAYS]
+#   HOST  : check_ssl_cert_expiry -H host [-p port] [-S servername] [-w DAYS] [-c DAYS]
+#
+# Defaults: warn=21 days, crit=7 days
+
+warn_days=21
+crit_days=7
+file=""
+host=""
+port="443"
+sni=""
+
+usage() {
+  echo "Usage:"
+  echo "  $0 -f /path/to/cert.pem [-w DAYS] [-c DAYS]"
+  echo "  $0 -H host [-p port] [-S sni_name] [-w DAYS] [-c DAYS]"
+}
+
+while getopts ":f:H:p:S:w:c:h" opt; do
+  case "$opt" in
+    f) file="$OPTARG" ;;
+    H) host="$OPTARG" ;;
+    p) port="$OPTARG" ;;
+    S) sni="$OPTARG" ;;
+    w) warn_days="$OPTARG" ;;
+    c) crit_days="$OPTARG" ;;
+    h) usage; exit 3 ;;
+    \?) echo "UNKNOWN - invalid option: -$OPTARG"; usage; exit 3 ;;
+    :)  echo "UNKNOWN - option -$OPTARG requires an argument"; usage; exit 3 ;;
+  esac
+done
+
+if [[ -z "$file" && -z "$host" ]]; then
+  echo "UNKNOWN - need -f (file) or -H (host)"
+  usage
+  exit 3
+fi
+
+if [[ -n "$file" && -n "$host" ]]; then
+  echo "UNKNOWN - use either -f OR -H, not both"
+  exit 3
+fi
+
+now_epoch="$(date +%s)"
+
+get_enddate_from_file() {
+  [[ -r "$file" ]] || { echo "UNKNOWN - cannot read cert file: $file"; exit 3; }
+  # enddate=Jan  6 23:13:01 2036 GMT
+  openssl x509 -in "$file" -noout -enddate 2>/dev/null | sed -n 's/^enddate=//p'
+}
+
+get_enddate_from_host() {
+  command -v openssl >/dev/null 2>&1 || { echo "UNKNOWN - openssl not found"; exit 3; }
+  local servername="${sni:-$host}"
+  # Use SNI so wildcard/vhosts work
+  # Print only leaf cert end date
+  timeout 10 openssl s_client -servername "$servername" -connect "${host}:${port}" </dev/null 2>/dev/null \
+    | openssl x509 -noout -enddate 2>/dev/null | sed -n 's/^enddate=//p'
+}
+
+enddate_str=""
+if [[ -n "$file" ]]; then
+  enddate_str="$(get_enddate_from_file || true)"
+  mode="file"
+  target="$file"
+else
+  enddate_str="$(get_enddate_from_host || true)"
+  mode="host"
+  target="${host}:${port}"
+fi
+
+if [[ -z "$enddate_str" ]]; then
+  echo "UNKNOWN - could not read certificate end date (${mode} ${target})"
+  exit 3
+fi
+
+# Convert to epoch
+end_epoch="$(date -d "$enddate_str" +%s 2>/dev/null || true)"
+if [[ -z "$end_epoch" ]]; then
+  echo "UNKNOWN - could not parse end date: $enddate_str"
+  exit 3
+fi
+
+remaining_sec=$(( end_epoch - now_epoch ))
+remaining_days=$(( remaining_sec / 86400 ))
+
+# Perfdata (days remaining)
+perf="days_left=${remaining_days};;;;0"
+
+if (( remaining_days < 0 )); then
+  echo "CRITICAL - cert EXPIRED ${remaining_days}d ago (end: $enddate_str) | $perf"
+  exit 2
+fi
+
+if (( remaining_days <= crit_days )); then
+  echo "CRITICAL - cert expires in ${remaining_days}d (end: $enddate_str) | $perf"
+  exit 2
+elif (( remaining_days <= warn_days )); then
+  echo "WARNING - cert expires in ${remaining_days}d (end: $enddate_str) | $perf"
+  exit 1
+else
+  echo "OK - cert valid ${remaining_days}d left (end: $enddate_str) | $perf"
+  exit 0
+fi
+EOF
+
 sudo chmod 0755 \
   "${NCPA_PLUGINS}/check_docker_restart_policy" \
+  "${NCPA_PLUGINS}/check_ssl_cert_expiry" \
   "${NCPA_PLUGINS}/check_docker_swarm_services"
 
 echo "[*] Creating/patching systemd unit ${SERVICE_FILE} ..."
