@@ -120,6 +120,7 @@ set -euo pipefail
 
 command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
 
+# Wenn keine Services existieren oder Host kein Manager ist => OK
 mapfile -t services < <(docker service ls --format '{{.ID}}|{{.Name}}|{{.Replicas}}' 2>/dev/null || true)
 if [[ ${#services[@]} -eq 0 ]]; then
   echo "OK - no swarm services"
@@ -139,14 +140,53 @@ for s in "${services[@]}"; do
   desired="${repl##*/}"
   total=$((total+1))
 
+  # Replicas mismatch => kritisch
   if [[ "$running" != "$desired" ]]; then
     degraded+=("${name}(${running}/${desired})")
     continue
   fi
 
-  if docker service ps "$id" --no-trunc --format '{{.CurrentState}} {{.Error}}' \
-      | grep -E '(Failed|Rejected)' >/dev/null; then
-    degraded+=("${name}(task-failure)")
+  # Task failures: nur "aktuelle" Tasks (desired-state=running) auswerten
+  # Wenn desired-state=running leer ist (z.B. global services / edge cases),
+  # dann fallback: pro Slot nur den neuesten Task betrachten.
+  out="$(docker service ps "$id" --no-trunc --filter desired-state=running \
+          --format '{{.Slot}}|{{.CurrentState}}|{{.Error}}' 2>/dev/null || true)"
+
+  if [[ -n "$out" ]]; then
+    # Für desired-state=running sollten alle "Running" sein
+    if echo "$out" | grep -E '(Failed|Rejected)' >/dev/null; then
+      degraded+=("${name}(task-failure)")
+      continue
+    fi
+    if echo "$out" | grep -v '^|Running' | grep -v 'Running ' >/dev/null 2>&1; then
+      # irgendwas ist nicht Running (z.B. Pending/Assigned/Preparing)
+      degraded+=("${name}(not-running)")
+      continue
+    fi
+  else
+    # Fallback: pro Slot nur den neuesten Task aus der History (service ps ist nach "neu zuerst")
+    # Wir nehmen den ersten Task je Slot und prüfen nur den.
+    mapfile -t lines < <(docker service ps "$id" --no-trunc --format '{{.Slot}}|{{.CurrentState}}|{{.Error}}' 2>/dev/null || true)
+    declare -A seen=()
+    for l in "${lines[@]}"; do
+      slot="${l%%|*}"
+      [[ -n "${seen[$slot]+x}" ]] && continue
+      seen["$slot"]=1
+
+      state="$(echo "$l" | cut -d'|' -f2)"
+      err="$(echo "$l" | cut -d'|' -f3)"
+
+      if echo "$state" | grep -E '(Failed|Rejected)' >/dev/null; then
+        degraded+=("${name}(task-failure)")
+        break
+      fi
+      # Shutdown ist nach Rollout normal; nur wenn Error drinsteht, werten
+      if echo "$state" | grep -q '^Shutdown' && [[ -n "$err" ]]; then
+        degraded+=("${name}(shutdown-error)")
+        break
+      fi
+    done
+    unset seen
   fi
 done
 
