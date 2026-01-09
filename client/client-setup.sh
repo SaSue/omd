@@ -1,137 +1,197 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-############################################
-# Konfiguration (per ENV überschreibbar)
-############################################
-NCPA_DIR="${NCPA_DIR:-/opt/ncpa-src}"
-VENV_DIR="${VENV_DIR:-/opt/ncpa-venv}"
-PORT="${NCPA_PORT:-5693}"
+# -------------------------
+# Config via ENV (empfohlen)
+# -------------------------
+: "${NCPA_TOKEN:?Set NCPA_TOKEN env var}"
+: "${NCPA_ALLOWED_HOSTS:=127.0.0.1,192.168.1.0/24}"
+: "${NCPA_PORT:=5693}"
+: "${NCPA_USE_SSL:=1}"                 # 1 = HTTPS, 0 = HTTP
+: "${NCPA_CERTIFICATE:=adhoc}"         # adhoc ok für intranet
+: "${NCPA_SSL_VERSION:=TLSv1_2}"
+: "${NCPA_BIND_IP:=0.0.0.0}"
 
-# MUSS gesetzt werden
-TOKEN="${NCPA_TOKEN:-}"
+# Optional: zusätzliche Netze (z.B. Docker bridge / proxy-net)
+# Beispiel: export NCPA_EXTRA_ALLOWED="172.17.0.0/16,10.0.5.0/24"
+: "${NCPA_EXTRA_ALLOWED:=}"
 
-# Lokales LAN
-LAN_CIDR="${NCPA_LAN_CIDR:-192.168.1.0/24}"
+# Paths (Source-Layout)
+NCPA_SRC="/opt/ncpa-src"
+NCPA_AGENT="${NCPA_SRC}/agent"
+NCPA_CFG="${NCPA_AGENT}/etc/ncpa.cfg"
+NCPA_PLUGINS="${NCPA_AGENT}/plugins"
+NCPA_VENV="/opt/ncpa-venv"
 
-# optionale zusätzliche Netze
-EXTRA_ALLOWED="${NCPA_EXTRA_ALLOWED_HOSTS:-}"
+SERVICE_FILE="/etc/systemd/system/ncpa_listener.service"
 
-# NCPA Source
-NCPA_GIT_URL="https://github.com/NagiosEnterprises/ncpa.git"
-
-############################################
-# Checks
-############################################
-if [[ -z "${TOKEN}" ]]; then
-  echo "ERROR: NCPA_TOKEN nicht gesetzt"
-  echo "Beispiel:"
-  echo "sudo NCPA_TOKEN=\"<TOKEN>\" bash $0"
-  exit 1
-fi
-
-############################################
-echo "[1/9] System vorbereiten"
-############################################
-sudo apt update
-sudo apt install -y \
-  git curl ca-certificates \
-  python3 python3-venv python3-pip \
-  build-essential python3-dev libffi-dev libssl-dev \
-  openssl \
-  nagios-plugins-contrib
-
-############################################
-echo "[2/9] NCPA Source holen / aktualisieren"
-############################################
-if [[ -d "${NCPA_DIR}/.git" ]]; then
-  sudo git -C "${NCPA_DIR}" pull --ff-only
-else
-  sudo rm -rf "${NCPA_DIR}"
-  sudo git clone --depth 1 "${NCPA_GIT_URL}" "${NCPA_DIR}"
-fi
-
-############################################
-echo "[3/9] Python venv erstellen"
-############################################
-sudo rm -rf "${VENV_DIR}"
-sudo python3 -m venv "${VENV_DIR}"
-sudo "${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel
-
-sudo "${VENV_DIR}/bin/pip" install \
-  flask flask-login flask-wtf werkzeug \
-  cryptography psutil requests pyopenssl waitress \
-  gevent gevent-websocket
-
-############################################
-echo "[4/9] allowed_hosts automatisch ermitteln"
-############################################
-ALLOWED_HOSTS="127.0.0.1,${LAN_CIDR}"
-
-if command -v docker >/dev/null 2>&1; then
-  while read -r net; do
-    subnet="$(docker network inspect "$net" --format '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)"
-    if [[ -n "${subnet}" && "${subnet}" != "<no value>" ]]; then
-      ALLOWED_HOSTS="${ALLOWED_HOSTS},${subnet}"
-    fi
-  done < <(docker network ls --format '{{.Name}}')
-fi
-
-if [[ -n "${EXTRA_ALLOWED}" ]]; then
-  ALLOWED_HOSTS="${ALLOWED_HOSTS},${EXTRA_ALLOWED}"
-fi
-
-# Duplikate entfernen
-ALLOWED_HOSTS="$(echo "${ALLOWED_HOSTS}" | tr ',' '\n' | awk 'NF{a[$0]=1} END{for(k in a) print k}' | sort | paste -sd, -)"
-echo "allowed_hosts = ${ALLOWED_HOSTS}"
-
-############################################
-echo "[5/9] NCPA Config schreiben (SSL + Token)"
-############################################
-CFG="${NCPA_DIR}/agent/etc/ncpa.cfg"
-SAMPLE="${NCPA_DIR}/agent/etc/ncpa.cfg.sample"
-sudo cp -f "${SAMPLE}" "${CFG}"
-
-set_kv () {
-  local k="$1" v="$2"
-  sudo sed -i -E "s|^[#;]?\s*${k}\s*=.*|${k} = ${v}|I" "${CFG}" || true
-  if ! grep -qiE "^${k}\s*=" "${CFG}"; then
-    echo "${k} = ${v}" | sudo tee -a "${CFG}" >/dev/null
+# -------------------------
+# Helper
+# -------------------------
+append_allowed_hosts() {
+  local base="$1"
+  local extra="$2"
+  if [[ -n "$extra" ]]; then
+    echo "${base},${extra}"
+  else
+    echo "${base}"
   fi
 }
 
-set_kv community_string "${TOKEN}"
-set_kv allowed_hosts "${ALLOWED_HOSTS}"
-set_kv ip "0.0.0.0"
-set_kv port "${PORT}"
+ALLOWED_HOSTS="$(append_allowed_hosts "$NCPA_ALLOWED_HOSTS" "$NCPA_EXTRA_ALLOWED")"
 
-# SSL
-set_kv use_ssl "1"
-set_kv certificate "adhoc"
-set_kv ssl_version "TLSv1_2"
+echo "[*] Installing prerequisites ..."
+sudo apt-get update -y
+sudo apt-get install -y --no-install-recommends \
+  ca-certificates curl jq python3 python3-venv python3-pip \
+  nagios-plugins-contrib
 
-############################################
-echo "[6/9] check_apt für NCPA verfügbar machen"
-############################################
-NCPA_PLUGDIR="${NCPA_DIR}/agent/plugins"
-sudo mkdir -p "${NCPA_PLUGDIR}"
+echo "[*] Ensure plugin directory exists: ${NCPA_PLUGINS}"
+sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
-if [[ -x /usr/lib/nagios/plugins/check_apt ]]; then
-  sudo ln -sf /usr/lib/nagios/plugins/check_apt "${NCPA_PLUGDIR}/check_apt"
-  sudo chmod +x "${NCPA_PLUGDIR}/check_apt"
+# -------------------------
+# (A) Deploy Docker plugins (only if docker exists)
+# -------------------------
+if command -v docker >/dev/null 2>&1; then
+  echo "[*] Docker detected -> installing NCPA docker plugins"
+
+  # 1) Restart-policy containers check
+  sudo tee "${NCPA_PLUGINS}/check_docker_restart_policy" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+bad_unhealthy=()
+bad_exited=()
+bad_restarting=()
+total=0
+running=0
+
+command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
+
+mapfile -t ids < <(docker ps -a --format '{{.ID}}')
+
+for id in "${ids[@]}"; do
+  restart="$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null || echo no)"
+  [[ "$restart" == "no" || -z "$restart" ]] && continue
+
+  total=$((total+1))
+  name="$(docker inspect --format '{{.Name}}' "$id" | sed 's|/||')"
+  state="$(docker inspect --format '{{.State.Status}}' "$id")"
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id")"
+
+  case "$state" in
+    running)
+      running=$((running+1))
+      [[ "$health" == "unhealthy" ]] && bad_unhealthy+=("$name")
+      ;;
+    exited|dead)
+      bad_exited+=("$name")
+      ;;
+    restarting)
+      bad_restarting+=("$name")
+      ;;
+  esac
+done
+
+msg="restart-policy containers: running ${running}/${total}"
+perf="total=${total} running=${running} unhealthy=${#bad_unhealthy[@]} exited=${#bad_exited[@]} restarting=${#bad_restarting[@]}"
+
+if (( ${#bad_unhealthy[@]} > 0 )); then
+  echo "CRITICAL - ${msg}; unhealthy: ${bad_unhealthy[*]} | ${perf}"
+  exit 2
+fi
+if (( ${#bad_exited[@]} > 0 )); then
+  echo "CRITICAL - ${msg}; exited: ${bad_exited[*]} | ${perf}"
+  exit 2
+fi
+if (( ${#bad_restarting[@]} > 0 )); then
+  echo "WARNING - ${msg}; restarting: ${bad_restarting[*]} | ${perf}"
+  exit 1
 fi
 
-# Security-Wrapper
-sudo tee "${NCPA_PLUGDIR}/check_apt_security" >/dev/null <<'EOF'
-#!/bin/bash
-/usr/lib/nagios/plugins/check_apt --only-security
+echo "OK - ${msg} | ${perf}"
+exit 0
 EOF
-sudo chmod +x "${NCPA_PLUGDIR}/check_apt_security"
 
-############################################
-echo "[7/9] systemd Service (-n + -l)"
-############################################
-sudo tee /etc/systemd/system/ncpa_listener.service >/dev/null <<SERVICE
+  # 2) Swarm services check (OK if no swarm services)
+  sudo tee "${NCPA_PLUGINS}/check_docker_swarm_services" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
+
+mapfile -t services < <(docker service ls --format '{{.ID}}|{{.Name}}|{{.Replicas}}' 2>/dev/null || true)
+if [[ ${#services[@]} -eq 0 ]]; then
+  echo "OK - no swarm services"
+  exit 0
+fi
+
+degraded=()
+total=0
+
+for s in "${services[@]}"; do
+  id="${s%%|*}"
+  rest="${s#*|}"
+  name="${rest%%|*}"
+  repl="${rest##*|}"
+
+  running="${repl%%/*}"
+  desired="${repl##*/}"
+  total=$((total+1))
+
+  if [[ "$running" != "$desired" ]]; then
+    degraded+=("${name}(${running}/${desired})")
+    continue
+  fi
+
+  if docker service ps "$id" --no-trunc --format '{{.CurrentState}} {{.Error}}' \
+      | grep -E '(Failed|Rejected)' >/dev/null; then
+    degraded+=("${name}(task-failure)")
+  fi
+done
+
+if (( ${#degraded[@]} > 0 )); then
+  echo "CRITICAL - swarm services degraded: ${degraded[*]}"
+  exit 2
+fi
+
+echo "OK - swarm services healthy (${total})"
+exit 0
+EOF
+
+  sudo chmod 0755 \
+    "${NCPA_PLUGINS}/check_docker_restart_policy" \
+    "${NCPA_PLUGINS}/check_docker_swarm_services"
+
+else
+  echo "[*] Docker not found -> skipping docker plugins"
+fi
+
+# -------------------------
+# (B) Ensure ncpa.cfg has the right values (ssl + allowed_hosts + bind)
+# -------------------------
+if [[ ! -f "${NCPA_CFG}" ]]; then
+  echo "[!] ${NCPA_CFG} not found. I assume you already staged NCPA source to ${NCPA_SRC}."
+  echo "    Please ensure NCPA source exists at ${NCPA_AGENT} and ncpa.cfg exists."
+  exit 1
+fi
+
+echo "[*] Updating NCPA config: ${NCPA_CFG}"
+sudo sed -i -E "s|^#?\s*community_string\s*=.*|community_string = ${NCPA_TOKEN}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*allowed_hosts\s*=.*|allowed_hosts = ${ALLOWED_HOSTS}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*ip\s*=.*|ip = ${NCPA_BIND_IP}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*port\s*=.*|port = ${NCPA_PORT}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*use_ssl\s*=.*|use_ssl = ${NCPA_USE_SSL}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*certificate\s*=.*|certificate = ${NCPA_CERTIFICATE}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*ssl_version\s*=.*|ssl_version = ${NCPA_SSL_VERSION}|g" "${NCPA_CFG}" || true
+
+# -------------------------
+# (C) Ensure systemd service uses -n -l and correct PYTHONPATH
+# -------------------------
+echo "[*] Ensuring systemd unit: ${SERVICE_FILE}"
+if [[ ! -f "${SERVICE_FILE}" ]]; then
+  echo "[!] ${SERVICE_FILE} not found. Creating it."
+  sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=NCPA Listener (source)
 After=network.target
@@ -139,32 +199,35 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=${NCPA_DIR}/agent
-Environment=PYTHONPATH=${NCPA_DIR}/agent
-ExecStart=${VENV_DIR}/bin/python ${NCPA_DIR}/agent/ncpa.py -n -l -c ${CFG}
+WorkingDirectory=${NCPA_AGENT}
+Environment=PYTHONPATH=${NCPA_AGENT}
+ExecStart=${NCPA_VENV}/bin/python ${NCPA_AGENT}/ncpa.py -n -l -c ${NCPA_CFG}
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+EOF
+else
+  # patch ExecStart line (idempotent)
+  sudo sed -i -E "s|^ExecStart=.*|ExecStart=${NCPA_VENV}/bin/python ${NCPA_AGENT}/ncpa.py -n -l -c ${NCPA_CFG}|g" "${SERVICE_FILE}"
+  sudo sed -i -E "s|^Environment=PYTHONPATH=.*|Environment=PYTHONPATH=${NCPA_AGENT}|g" "${SERVICE_FILE}"
+  sudo sed -i -E "s|^WorkingDirectory=.*|WorkingDirectory=${NCPA_AGENT}|g" "${SERVICE_FILE}"
+fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now ncpa_listener
-
-############################################
-echo "[8/9] NCPA Neustart"
-############################################
 sudo systemctl restart ncpa_listener
-sleep 1
 
-############################################
-echo "[9/9] Lokaler Test"
-############################################
-curl -sk "https://127.0.0.1:${PORT}/api/system?token=${TOKEN}" | head -c 200 && echo
-curl -sk "https://127.0.0.1:${PORT}/api/plugins/check_apt?token=${TOKEN}" || true
+echo "[*] Verifying plugins visible via API ..."
+if [[ "${NCPA_USE_SSL}" == "1" ]]; then
+  curl -sk "https://127.0.0.1:${NCPA_PORT}/api/plugins?token=${NCPA_TOKEN}" | head -c 1200 || true
+else
+  curl -s "http://127.0.0.1:${NCPA_PORT}/api/plugins?token=${NCPA_TOKEN}" | head -c 1200 || true
+fi
 
-echo "========================================="
-echo "FERTIG ✅  NCPA läuft auf Port ${PORT}"
-echo "APT Updates & Security Updates verfügbar"
-echo "========================================="
+echo "[OK] Rollout finished.
+- allowed_hosts=${ALLOWED_HOSTS}
+- use_ssl=${NCPA_USE_SSL} port=${NCPA_PORT}
+- docker plugins: $(command -v docker >/dev/null 2>&1 && echo installed || echo skipped)
+"
