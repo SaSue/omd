@@ -107,6 +107,10 @@ sudo sed -i -E \
   -e 's|^#?\s*gid\s*=.*|gid = root|' \
   "${NCPA_CFG}" 
 
+echo "[*] Installing APT Check plugin into ${NCPA_PLUGINS} ..."
+sudo ln -sf /usr/lib/nagios/plugins/check_apt /opt/ncpa-src/agent/plugins/check_apt
+sudo chmod +x /opt/ncpa-src/agent/plugins/check_apt
+
 echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
