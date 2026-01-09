@@ -2,21 +2,23 @@
 set -euo pipefail
 
 # -------------------------
-# Config via ENV (empfohlen)
+# Required ENV
 # -------------------------
 : "${NCPA_TOKEN:?Set NCPA_TOKEN env var}"
-: "${NCPA_ALLOWED_HOSTS:=127.0.0.1,192.168.1.0/24}"
+: "${NCPA_ALLOWED_HOSTS:?Set NCPA_ALLOWED_HOSTS env var}"
+
+# -------------------------
+# Optional ENV defaults
+# -------------------------
 : "${NCPA_PORT:=5693}"
-: "${NCPA_USE_SSL:=1}"                 # 1 = HTTPS, 0 = HTTP
-: "${NCPA_CERTIFICATE:=adhoc}"         # adhoc ok für intranet
-: "${NCPA_SSL_VERSION:=TLSv1_2}"
 : "${NCPA_BIND_IP:=0.0.0.0}"
+: "${NCPA_USE_SSL:=1}"                 # 1=https, 0=http
+: "${NCPA_CERTIFICATE:=adhoc}"         # adhoc ok
+: "${NCPA_SSL_VERSION:=TLSv1_2}"
+: "${NCPA_EXTRA_ALLOWED:=}"            # e.g. "172.17.0.0/16,10.0.5.0/24"
+: "${NCPA_REF:=}"                      # e.g. "v3.2.2" or commit; empty = default branch
 
-# Optional: zusätzliche Netze (z.B. Docker bridge / proxy-net)
-# Beispiel: export NCPA_EXTRA_ALLOWED="172.17.0.0/16,10.0.5.0/24"
-: "${NCPA_EXTRA_ALLOWED:=}"
-
-# Paths (Source-Layout)
+# Layout (wie bei dir)
 NCPA_SRC="/opt/ncpa-src"
 NCPA_AGENT="${NCPA_SRC}/agent"
 NCPA_CFG="${NCPA_AGENT}/etc/ncpa.cfg"
@@ -24,49 +26,97 @@ NCPA_PLUGINS="${NCPA_AGENT}/plugins"
 NCPA_VENV="/opt/ncpa-venv"
 
 SERVICE_FILE="/etc/systemd/system/ncpa_listener.service"
+SERVICE_NAME="ncpa_listener"
 
-# -------------------------
-# Helper
-# -------------------------
-append_allowed_hosts() {
-  local base="$1"
-  local extra="$2"
-  if [[ -n "$extra" ]]; then
-    echo "${base},${extra}"
-  else
-    echo "${base}"
-  fi
-}
+ALLOWED_HOSTS="${NCPA_ALLOWED_HOSTS}"
+if [[ -n "${NCPA_EXTRA_ALLOWED}" ]]; then
+  ALLOWED_HOSTS="${ALLOWED_HOSTS},${NCPA_EXTRA_ALLOWED}"
+fi
 
-ALLOWED_HOSTS="$(append_allowed_hosts "$NCPA_ALLOWED_HOSTS" "$NCPA_EXTRA_ALLOWED")"
-
-echo "[*] Installing prerequisites ..."
+echo "[*] Installing prerequisites (apt)..."
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends \
-  ca-certificates curl jq python3 python3-venv python3-pip \
+  ca-certificates curl jq git \
+  python3 python3-venv python3-pip \
   nagios-plugins-contrib
 
-echo "[*] Ensure plugin directory exists: ${NCPA_PLUGINS}"
+echo "[*] Ensuring NCPA source exists at ${NCPA_SRC} ..."
+if [[ ! -d "${NCPA_SRC}/.git" ]]; then
+  sudo mkdir -p "${NCPA_SRC}"
+  sudo chown -R root:root "${NCPA_SRC}"
+  # Clone as root, keep permissions predictable
+  sudo git clone https://github.com/NagiosEnterprises/ncpa.git "${NCPA_SRC}"
+else
+  echo "    Source already present, pulling updates..."
+  sudo git -C "${NCPA_SRC}" fetch --all --tags
+fi
+
+if [[ -n "${NCPA_REF}" ]]; then
+  echo "[*] Checking out ref: ${NCPA_REF}"
+  sudo git -C "${NCPA_SRC}" checkout -f "${NCPA_REF}"
+else
+  echo "[*] Using default branch (no NCPA_REF provided)"
+  sudo git -C "${NCPA_SRC}" checkout -f "$(sudo git -C "${NCPA_SRC}" symbolic-ref --short HEAD)"
+fi
+
+if [[ ! -d "${NCPA_AGENT}" ]]; then
+  echo "[!] Expected agent dir not found: ${NCPA_AGENT}"
+  echo "    Repo layout unexpected. Aborting."
+  exit 1
+fi
+
+echo "[*] Creating venv at ${NCPA_VENV} ..."
+if [[ ! -x "${NCPA_VENV}/bin/python" ]]; then
+  sudo python3 -m venv "${NCPA_VENV}"
+fi
+
+echo "[*] Installing python runtime deps into venv ..."
+# NCPA source install ohne wheel build: wir installieren Runtime deps direkt.
+sudo "${NCPA_VENV}/bin/pip" install -U pip setuptools wheel >/dev/null
+
+# Runtime deps, die du in der Praxis gebraucht hast (flask, geventwebsocket etc.)
+sudo "${NCPA_VENV}/bin/pip" install -U \
+  flask requests psutil \
+  gevent gevent-websocket geventhttpclient \
+  cryptography pyopenssl \
+  jinja2 werkzeug itsdangerous click >/dev/null
+
+echo "[*] Ensuring ncpa.cfg exists ..."
+if [[ ! -f "${NCPA_CFG}" ]]; then
+  # fallback: some repos keep example config
+  if [[ -f "${NCPA_AGENT}/etc/ncpa.cfg.example" ]]; then
+    sudo cp -a "${NCPA_AGENT}/etc/ncpa.cfg.example" "${NCPA_CFG}"
+  else
+    echo "[!] ncpa.cfg not found at ${NCPA_CFG}"
+    exit 1
+  fi
+fi
+
+echo "[*] Configuring ncpa.cfg (token, allowed_hosts, ssl, bind, port) ..."
+# Set/replace keys (uncomment if needed)
+sudo sed -i -E "s|^#?\s*community_string\s*=.*|community_string = ${NCPA_TOKEN}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*allowed_hosts\s*=.*|allowed_hosts = ${ALLOWED_HOSTS}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*ip\s*=.*|ip = ${NCPA_BIND_IP}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*port\s*=.*|port = ${NCPA_PORT}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*use_ssl\s*=.*|use_ssl = ${NCPA_USE_SSL}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*certificate\s*=.*|certificate = ${NCPA_CERTIFICATE}|g" "${NCPA_CFG}" || true
+sudo sed -i -E "s|^#?\s*ssl_version\s*=.*|ssl_version = ${NCPA_SSL_VERSION}|g" "${NCPA_CFG}" || true
+
+echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
-# -------------------------
-# (A) Deploy Docker plugins (only if docker exists)
-# -------------------------
-if command -v docker >/dev/null 2>&1; then
-  echo "[*] Docker detected -> installing NCPA docker plugins"
-
-  # 1) Restart-policy containers check
-  sudo tee "${NCPA_PLUGINS}/check_docker_restart_policy" >/dev/null <<'EOF'
+# --- check_docker_restart_policy ---
+sudo tee "${NCPA_PLUGINS}/check_docker_restart_policy" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
 
 bad_unhealthy=()
 bad_exited=()
 bad_restarting=()
 total=0
 running=0
-
-command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
 
 mapfile -t ids < <(docker ps -a --format '{{.ID}}')
 
@@ -113,14 +163,13 @@ echo "OK - ${msg} | ${perf}"
 exit 0
 EOF
 
-  # 2) Swarm services check (OK if no swarm services)
-  sudo tee "${NCPA_PLUGINS}/check_docker_swarm_services" >/dev/null <<'EOF'
+# --- check_docker_swarm_services (fixed: no history false positives) ---
+sudo tee "${NCPA_PLUGINS}/check_docker_swarm_services" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
 
-# Wenn keine Services existieren oder Host kein Manager ist => OK
 mapfile -t services < <(docker service ls --format '{{.ID}}|{{.Name}}|{{.Replicas}}' 2>/dev/null || true)
 if [[ ${#services[@]} -eq 0 ]]; then
   echo "OK - no swarm services"
@@ -140,53 +189,25 @@ for s in "${services[@]}"; do
   desired="${repl##*/}"
   total=$((total+1))
 
-  # Replicas mismatch => kritisch
   if [[ "$running" != "$desired" ]]; then
     degraded+=("${name}(${running}/${desired})")
     continue
   fi
 
-  # Task failures: nur "aktuelle" Tasks (desired-state=running) auswerten
-  # Wenn desired-state=running leer ist (z.B. global services / edge cases),
-  # dann fallback: pro Slot nur den neuesten Task betrachten.
+  # Only evaluate current desired-state=running tasks (ignore old history fails)
   out="$(docker service ps "$id" --no-trunc --filter desired-state=running \
-          --format '{{.Slot}}|{{.CurrentState}}|{{.Error}}' 2>/dev/null || true)"
+          --format '{{.CurrentState}} {{.Error}}' 2>/dev/null || true)"
 
   if [[ -n "$out" ]]; then
-    # Für desired-state=running sollten alle "Running" sein
     if echo "$out" | grep -E '(Failed|Rejected)' >/dev/null; then
       degraded+=("${name}(task-failure)")
       continue
     fi
-    if echo "$out" | grep -v '^|Running' | grep -v 'Running ' >/dev/null 2>&1; then
-      # irgendwas ist nicht Running (z.B. Pending/Assigned/Preparing)
-      degraded+=("${name}(not-running)")
+    # If any desired-state=running task isn't Running yet => warning-ish, treat as degraded
+    if echo "$out" | grep -v '^Running ' >/dev/null; then
+      degraded+=("${name}(not-running-yet)")
       continue
     fi
-  else
-    # Fallback: pro Slot nur den neuesten Task aus der History (service ps ist nach "neu zuerst")
-    # Wir nehmen den ersten Task je Slot und prüfen nur den.
-    mapfile -t lines < <(docker service ps "$id" --no-trunc --format '{{.Slot}}|{{.CurrentState}}|{{.Error}}' 2>/dev/null || true)
-    declare -A seen=()
-    for l in "${lines[@]}"; do
-      slot="${l%%|*}"
-      [[ -n "${seen[$slot]+x}" ]] && continue
-      seen["$slot"]=1
-
-      state="$(echo "$l" | cut -d'|' -f2)"
-      err="$(echo "$l" | cut -d'|' -f3)"
-
-      if echo "$state" | grep -E '(Failed|Rejected)' >/dev/null; then
-        degraded+=("${name}(task-failure)")
-        break
-      fi
-      # Shutdown ist nach Rollout normal; nur wenn Error drinsteht, werten
-      if echo "$state" | grep -q '^Shutdown' && [[ -n "$err" ]]; then
-        degraded+=("${name}(shutdown-error)")
-        break
-      fi
-    done
-    unset seen
   fi
 done
 
@@ -199,39 +220,12 @@ echo "OK - swarm services healthy (${total})"
 exit 0
 EOF
 
-  sudo chmod 0755 \
-    "${NCPA_PLUGINS}/check_docker_restart_policy" \
-    "${NCPA_PLUGINS}/check_docker_swarm_services"
+sudo chmod 0755 \
+  "${NCPA_PLUGINS}/check_docker_restart_policy" \
+  "${NCPA_PLUGINS}/check_docker_swarm_services"
 
-else
-  echo "[*] Docker not found -> skipping docker plugins"
-fi
-
-# -------------------------
-# (B) Ensure ncpa.cfg has the right values (ssl + allowed_hosts + bind)
-# -------------------------
-if [[ ! -f "${NCPA_CFG}" ]]; then
-  echo "[!] ${NCPA_CFG} not found. I assume you already staged NCPA source to ${NCPA_SRC}."
-  echo "    Please ensure NCPA source exists at ${NCPA_AGENT} and ncpa.cfg exists."
-  exit 1
-fi
-
-echo "[*] Updating NCPA config: ${NCPA_CFG}"
-sudo sed -i -E "s|^#?\s*community_string\s*=.*|community_string = ${NCPA_TOKEN}|g" "${NCPA_CFG}" || true
-sudo sed -i -E "s|^#?\s*allowed_hosts\s*=.*|allowed_hosts = ${ALLOWED_HOSTS}|g" "${NCPA_CFG}" || true
-sudo sed -i -E "s|^#?\s*ip\s*=.*|ip = ${NCPA_BIND_IP}|g" "${NCPA_CFG}" || true
-sudo sed -i -E "s|^#?\s*port\s*=.*|port = ${NCPA_PORT}|g" "${NCPA_CFG}" || true
-sudo sed -i -E "s|^#?\s*use_ssl\s*=.*|use_ssl = ${NCPA_USE_SSL}|g" "${NCPA_CFG}" || true
-sudo sed -i -E "s|^#?\s*certificate\s*=.*|certificate = ${NCPA_CERTIFICATE}|g" "${NCPA_CFG}" || true
-sudo sed -i -E "s|^#?\s*ssl_version\s*=.*|ssl_version = ${NCPA_SSL_VERSION}|g" "${NCPA_CFG}" || true
-
-# -------------------------
-# (C) Ensure systemd service uses -n -l and correct PYTHONPATH
-# -------------------------
-echo "[*] Ensuring systemd unit: ${SERVICE_FILE}"
-if [[ ! -f "${SERVICE_FILE}" ]]; then
-  echo "[!] ${SERVICE_FILE} not found. Creating it."
-  sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
+echo "[*] Creating/patching systemd unit ${SERVICE_FILE} ..."
+sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=NCPA Listener (source)
 After=network.target
@@ -248,26 +242,37 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-else
-  # patch ExecStart line (idempotent)
-  sudo sed -i -E "s|^ExecStart=.*|ExecStart=${NCPA_VENV}/bin/python ${NCPA_AGENT}/ncpa.py -n -l -c ${NCPA_CFG}|g" "${SERVICE_FILE}"
-  sudo sed -i -E "s|^Environment=PYTHONPATH=.*|Environment=PYTHONPATH=${NCPA_AGENT}|g" "${SERVICE_FILE}"
-  sudo sed -i -E "s|^WorkingDirectory=.*|WorkingDirectory=${NCPA_AGENT}|g" "${SERVICE_FILE}"
-fi
 
+echo "[*] Starting/restarting ${SERVICE_NAME} ..."
 sudo systemctl daemon-reload
-sudo systemctl enable --now ncpa_listener
-sudo systemctl restart ncpa_listener
+sudo systemctl enable --now "${SERVICE_NAME}"
 
-echo "[*] Verifying plugins visible via API ..."
-if [[ "${NCPA_USE_SSL}" == "1" ]]; then
-  curl -sk "https://127.0.0.1:${NCPA_PORT}/api/plugins?token=${NCPA_TOKEN}" | head -c 1200 || true
-else
-  curl -s "http://127.0.0.1:${NCPA_PORT}/api/plugins?token=${NCPA_TOKEN}" | head -c 1200 || true
+# Kill stale listeners if they kept the port (your earlier issue)
+if sudo ss -tlnp | grep -q ":${NCPA_PORT}"; then
+  # If multiple pids bind, systemd restart alone may not clear it; best effort kill old python on port
+  pids="$(sudo ss -tlnp | awk -v p=":${NCPA_PORT}" '$0 ~ p {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/' | sort -u)"
+  if [[ -n "${pids}" ]]; then
+    for pid in ${pids}; do
+      # don't kill our current one if systemd already started (best effort)
+      sudo kill "${pid}" >/dev/null 2>&1 || true
+    done
+  fi
 fi
 
-echo "[OK] Rollout finished.
+sudo systemctl restart "${SERVICE_NAME}"
+
+echo "[*] Quick API check ..."
+if [[ "${NCPA_USE_SSL}" == "1" ]]; then
+  curl -sk "https://127.0.0.1:${NCPA_PORT}/api/system?token=${NCPA_TOKEN}" | head -c 400; echo
+  curl -sk "https://127.0.0.1:${NCPA_PORT}/api/plugins?token=${NCPA_TOKEN}" | head -c 400; echo
+else
+  curl -s "http://127.0.0.1:${NCPA_PORT}/api/system?token=${NCPA_TOKEN}" | head -c 400; echo
+  curl -s "http://127.0.0.1:${NCPA_PORT}/api/plugins?token=${NCPA_TOKEN}" | head -c 400; echo
+fi
+
+echo "[OK] Done.
+- token set
 - allowed_hosts=${ALLOWED_HOSTS}
-- use_ssl=${NCPA_USE_SSL} port=${NCPA_PORT}
-- docker plugins: $(command -v docker >/dev/null 2>&1 && echo installed || echo skipped)
+- ssl=${NCPA_USE_SSL} port=${NCPA_PORT}
+- plugins: check_docker_restart_policy, check_docker_swarm_services
 "
