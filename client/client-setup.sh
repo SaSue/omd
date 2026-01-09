@@ -101,6 +101,11 @@ sudo sed -i -E "s|^#?\s*port\s*=.*|port = ${NCPA_PORT}|g" "${NCPA_CFG}" || true
 sudo sed -i -E "s|^#?\s*use_ssl\s*=.*|use_ssl = ${NCPA_USE_SSL}|g" "${NCPA_CFG}" || true
 sudo sed -i -E "s|^#?\s*certificate\s*=.*|certificate = ${NCPA_CERTIFICATE}|g" "${NCPA_CFG}" || true
 sudo sed -i -E "s|^#?\s*ssl_version\s*=.*|ssl_version = ${NCPA_SSL_VERSION}|g" "${NCPA_CFG}" || true
+# ensure uid/gid exist (default "nagios" breaks on fresh clients)
+sudo sed -i -E \
+  -e 's|^#?\s*uid\s*=.*|uid = root|' \
+  -e 's|^#?\s*gid\s*=.*|gid = root|' \
+  /opt/ncpa-src/agent/etc/ncpa.cfg
 
 echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
