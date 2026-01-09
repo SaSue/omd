@@ -170,10 +170,15 @@ EOF
 
 # --- check_docker_swarm_services (fixed: no history false positives) ---
 sudo tee "${NCPA_PLUGINS}/check_docker_swarm_services" >/dev/null <<'EOF'
+sudo tee /opt/ncpa-src/agent/plugins/check_docker_swarm_services >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 command -v docker >/dev/null 2>&1 || { echo "UNKNOWN - docker not found"; exit 3; }
+
+# Optional: zusätzlich per ENV ignorieren (Regex auf Service-Name)
+# Beispiel: export MONITORING_IGNORE_REGEX='^(certbot|backup|job-.*)$'
+IGNORE_REGEX="${MONITORING_IGNORE_REGEX:-}"
 
 mapfile -t services < <(docker service ls --format '{{.ID}}|{{.Name}}|{{.Replicas}}' 2>/dev/null || true)
 if [[ ${#services[@]} -eq 0 ]]; then
@@ -183,6 +188,8 @@ fi
 
 degraded=()
 total=0
+checked=0
+ignored=0
 
 for s in "${services[@]}"; do
   id="${s%%|*}"
@@ -190,16 +197,32 @@ for s in "${services[@]}"; do
   name="${rest%%|*}"
   repl="${rest##*|}"
 
-  running="${repl%%/*}"
-  desired="${repl##*/}"
+  # 1) Ignore by label monitoring.ignore=true
+  ign="$(docker service inspect "$id" --format '{{ index .Spec.Labels "monitoring.ignore" }}' 2>/dev/null || true)"
+  if [[ "$ign" == "true" || "$ign" == "1" || "$ign" == "yes" ]]; then
+    ignored=$((ignored+1))
+    continue
+  fi
+
+  # 2) Optional ignore by regex on service name
+  if [[ -n "$IGNORE_REGEX" ]] && echo "$name" | grep -Eq "$IGNORE_REGEX"; then
+    ignored=$((ignored+1))
+    continue
+  fi
+
+  checked=$((checked+1))
   total=$((total+1))
 
+  running="${repl%%/*}"
+  desired="${repl##*/}"
+
+  # Replicas mismatch => kritisch (gilt für replicated services)
   if [[ "$running" != "$desired" ]]; then
     degraded+=("${name}(${running}/${desired})")
     continue
   fi
 
-  # Only evaluate current desired-state=running tasks (ignore old history fails)
+  # Task-Failures: nur CURRENT desired-state=running (History ignorieren)
   out="$(docker service ps "$id" --no-trunc --filter desired-state=running \
           --format '{{.CurrentState}} {{.Error}}' 2>/dev/null || true)"
 
@@ -208,7 +231,7 @@ for s in "${services[@]}"; do
       degraded+=("${name}(task-failure)")
       continue
     fi
-    # If any desired-state=running task isn't Running yet => warning-ish, treat as degraded
+    # Alles, was noch nicht Running ist, als "degraded" melden (Rollout/Startphase)
     if echo "$out" | grep -v '^Running ' >/dev/null; then
       degraded+=("${name}(not-running-yet)")
       continue
@@ -216,12 +239,18 @@ for s in "${services[@]}"; do
   fi
 done
 
+# Wenn ALLE Services ignoriert werden => OK
+if (( checked == 0 )); then
+  echo "OK - all swarm services ignored (${ignored})"
+  exit 0
+fi
+
 if (( ${#degraded[@]} > 0 )); then
-  echo "CRITICAL - swarm services degraded: ${degraded[*]}"
+  echo "CRITICAL - swarm services degraded: ${degraded[*]} (checked=${checked}, ignored=${ignored})"
   exit 2
 fi
 
-echo "OK - swarm services healthy (${total})"
+echo "OK - swarm services healthy (checked=${checked}, ignored=${ignored})"
 exit 0
 EOF
 
