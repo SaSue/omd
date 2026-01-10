@@ -356,9 +356,25 @@ else
 fi
 EOF
 
+sudo tee "/${NCPA_PLUGINS}/run_apt_update" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "Starting manual APT update at $(date)"
+
+apt-get update
+apt-get -y upgrade
+apt-get -y autoremove
+
+echo "APT update finished at $(date)"
+EOF
+
 sudo chmod 0755 \
   "${NCPA_PLUGINS}/check_docker_restart_policy" \
   "${NCPA_PLUGINS}/check_ssl_cert_expiry" \
+  "${NCPA_PLUGINS}/run_apt_update" \
   "${NCPA_PLUGINS}/check_docker_swarm_services"
 
 echo "[*] Creating/patching systemd unit ${SERVICE_FILE} ..."
