@@ -174,7 +174,6 @@ EOF
 
 # --- check_docker_swarm_services (fixed: no history false positives) ---
 sudo tee "${NCPA_PLUGINS}/check_docker_swarm_services" >/dev/null <<'EOF'
-
 #!/usr/bin/env bash
 set -euo pipefail
 
