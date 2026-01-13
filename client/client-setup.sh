@@ -114,6 +114,126 @@ sudo chmod +x /opt/ncpa-src/agent/plugins/check_apt
 echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
+sudo tee ${NCPA_PLUGINS}/check_apt_list >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TIMEOUT=120
+MAX_LINES=25
+WARN_N=""
+CRIT_N=""
+SECURITY_SCAN=1
+
+usage() {
+  cat <<USAGE
+check_apt_list - list available APT updates (no install), mark security updates
+
+Options:
+  -t SEC     timeout for the whole check (default: 120)
+  -m N       max number of packages to print (default: 25)
+  -w N       warning threshold by number of available updates
+  -c N       critical threshold by number of available updates
+  --no-security-scan   do not classify security updates (faster)
+USAGE
+}
+
+# --- args ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t) TIMEOUT="${2:-}"; shift 2;;
+    -m) MAX_LINES="${2:-}"; shift 2;;
+    -w) WARN_N="${2:-}"; shift 2;;
+    -c) CRIT_N="${2:-}"; shift 2;;
+    --no-security-scan) SECURITY_SCAN=0; shift;;
+    -h|--help) usage; exit 3;;
+    *) echo "UNKNOWN - unknown arg: $1"; usage; exit 3;;
+  esac
+done
+
+run_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${TIMEOUT}" "$@"
+  else
+    "$@"
+  fi
+}
+
+# --- collect upgradable packages ---
+# We rely on current apt cache. This script does NOT run "apt update".
+UPG_LIST="$(run_timeout bash -lc 'LANG=C apt list --upgradable 2>/dev/null | tail -n +2' || true)"
+
+if [[ -z "${UPG_LIST// }" ]]; then
+  echo "OK - no updates available |available_upgrades=0;;;0 security_updates=0;;;0"
+  exit 0
+fi
+
+mapfile -t PKGS < <(printf '%s\n' "$UPG_LIST" | awk -F'/' '{print $1}' | sed 's/ *$//' | grep -v '^$' || true)
+
+TOTAL="${#PKGS[@]}"
+SEC=0
+
+# --- detect security updates (best-effort heuristic) ---
+# We inspect apt-cache policy output and look for repos containing "security".
+declare -A IS_SEC
+if [[ "$SECURITY_SCAN" -eq 1 ]]; then
+  for p in "${PKGS[@]}"; do
+    # policy can be slow on tiny devices; keep it under the global timeout
+    out="$(run_timeout apt-cache policy "$p" 2>/dev/null || true)"
+    if echo "$out" | grep -Eqi 'security|debian-security|raspbian.*security|ubuntu.*-security'; then
+      IS_SEC["$p"]=1
+      ((SEC+=1))
+    fi
+  done
+fi
+
+# --- thresholds & exit code ---
+RC=0
+STATE="OK"
+
+# If explicit thresholds are set, honor them.
+if [[ -n "$CRIT_N" && "$TOTAL" -ge "$CRIT_N" ]]; then
+  RC=2; STATE="CRITICAL"
+elif [[ -n "$WARN_N" && "$TOTAL" -ge "$WARN_N" ]]; then
+  RC=1; STATE="WARNING"
+else
+  # Default policy: any security updates => CRIT, else any updates => WARN
+  if [[ "$SECURITY_SCAN" -eq 1 && "$SEC" -gt 0 ]]; then
+    RC=2; STATE="CRITICAL"
+  else
+    RC=1; STATE="WARNING"
+  fi
+fi
+
+# --- build compact output list ---
+PRINT_N="$MAX_LINES"
+if [[ "$TOTAL" -lt "$PRINT_N" ]]; then PRINT_N="$TOTAL"; fi
+
+lines=()
+for ((i=0; i<PRINT_N; i++)); do
+  p="${PKGS[$i]}"
+  if [[ "${IS_SEC[$p]:-0}" -eq 1 ]]; then
+    lines+=("[SEC] $p")
+  else
+    lines+=("$p")
+  fi
+done
+
+EXTRA=""
+if [[ "$TOTAL" -gt "$PRINT_N" ]]; then
+  EXTRA=" (+$((TOTAL-PRINT_N)) more)"
+fi
+
+LIST_OUT="$(printf '%s, ' "${lines[@]}" | sed 's/, $//')${EXTRA}"
+
+if [[ "$SECURITY_SCAN" -eq 0 ]]; then
+  echo "$STATE - updates=$TOTAL (security-scan=off): $LIST_OUT |available_upgrades=$TOTAL;;;0"
+else
+  echo "$STATE - updates=$TOTAL security=$SEC: $LIST_OUT |available_upgrades=$TOTAL;;;0 security_updates=$SEC;;;0"
+fi
+
+exit "$RC"
+EOF
+
 # --- check_docker_restart_policy ---
 sudo tee "${NCPA_PLUGINS}/check_docker_restart_policy" >/dev/null <<'EOF'
 #!/usr/bin/env bash
@@ -375,7 +495,10 @@ sudo chmod 0755 \
   "${NCPA_PLUGINS}/check_docker_restart_policy" \
   "${NCPA_PLUGINS}/check_ssl_cert_expiry" \
   "${NCPA_PLUGINS}/run_apt_update" \
-  "${NCPA_PLUGINS}/check_docker_swarm_services"
+  "${NCPA_PLUGINS}/check_docker_swarm_services" \
+  "${NCPA_PLUGINS}/check_apt_list"
+
+
 
 echo "[*] Creating/patching systemd unit ${SERVICE_FILE} ..."
 sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
