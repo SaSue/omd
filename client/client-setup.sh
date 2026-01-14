@@ -114,7 +114,7 @@ sudo chmod +x /opt/ncpa-src/agent/plugins/check_apt
 echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
-sudo tee ${NCPA_PLUGINS}/check_cpu_temp << 'EOF'
+sudo tee ${NCPA_PLUGINS}/check_cpu_temp >/dev/null << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
