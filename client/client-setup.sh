@@ -128,31 +128,44 @@ while getopts "w:c:" o; do
   esac
 done
 
-# 1️⃣ coretemp (Intel / AMD)
-TEMP=$(sensors 2>/dev/null | awk '
-/coretemp/ { core=1 }
-core && /Package id 0:/ {
-  gsub(/[+°C]/,"",$4); print $4; exit
-}
-')
+TEMP=""
 
-# 2️⃣ fallback: CPU Core temp (Apple SMC)
-if [[ -z "${TEMP:-}" ]]; then
-  TEMP=$(sensors 2>/dev/null | awk '
-/applesmc/ { smc=1 }
-smc && /^TC0C:/ {
-  gsub(/[+°C]/,"",$2); print $2; exit
-}
-')
+# 0) Raspberry Pi: sysfs (milli°C)
+if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
+  raw="$(cat /sys/class/thermal/thermal_zone0/temp || true)"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    # integer °C
+    TEMP=$(( raw / 1000 ))
+  fi
 fi
 
-# 3️⃣ letzter Fallback (NOT ideal)
-if [[ -z "${TEMP:-}" ]]; then
-  TEMP=$(sensors 2>/dev/null | awk '
-/temp1:/ {
-  gsub(/[+°C]/,"",$2); print $2; exit
+# 1) Intel/AMD: coretemp Package id 0
+if [[ -z "$TEMP" ]] && command -v sensors >/dev/null 2>&1; then
+  TEMP="$(sensors 2>/dev/null | awk '
+/coretemp/ { core=1 }
+core && /Package id 0:/ {
+  gsub(/[+°C]/,"",$4); print int($4); exit
 }
-')
+')"
+fi
+
+# 2) Apple SMC fallback
+if [[ -z "$TEMP" ]] && command -v sensors >/dev/null 2>&1; then
+  TEMP="$(sensors 2>/dev/null | awk '
+/applesmc/ { smc=1 }
+smc && /^TC0C:/ {
+  gsub(/[+°C]/,"",$2); print int($2); exit
+}
+')"
+fi
+
+# 3) Generic fallback
+if [[ -z "$TEMP" ]] && command -v sensors >/dev/null 2>&1; then
+  TEMP="$(sensors 2>/dev/null | awk '
+/temp1:/ {
+  gsub(/[+°C]/,"",$2); print int($2); exit
+}
+')"
 fi
 
 if [[ -z "${TEMP:-}" ]]; then
@@ -163,10 +176,10 @@ fi
 STATUS="OK"
 RC=0
 
-if (( $(echo "$TEMP >= $CRIT" | bc -l) )); then
+if (( TEMP >= CRIT )); then
   STATUS="CRITICAL"
   RC=2
-elif (( $(echo "$TEMP >= $WARN" | bc -l) )); then
+elif (( TEMP >= WARN )); then
   STATUS="WARNING"
   RC=1
 fi
