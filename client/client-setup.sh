@@ -116,24 +116,30 @@ sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
 sudo tee ${NCPA_PLUGINS}/check_cpu_temp << 'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
 
-WARN=${1:-75}
-CRIT=${2:-85}
-
+WARN="${1:-75}"
+CRIT="${2:-85}"
 FILE="/sys/class/thermal/thermal_zone0/temp"
 
-[ ! -r "$FILE" ] && echo "UNKNOWN - CPU temp not readable" && exit 3
+if [[ ! -r "$FILE" ]]; then
+  echo "UNKNOWN - CPU temp not readable ($FILE)"
+  exit 3
+fi
 
-TEMP=$(awk '{print $1/1000}' "$FILE")
+# Milligrad -> Grad (immer mit Punkt als Dezimaltrenner)
+RAW="$(cat "$FILE")"
+TEMP="$(awk -v r="$RAW" 'BEGIN{printf "%.1f", r/1000}')"
 
-if (( $(echo "$TEMP >= $CRIT" | bc -l) )); then
-  echo "CRITICAL - CPU temp ${TEMP}°C | temp=${TEMP};$WARN;$CRIT"
+# Vergleiche ohne bc (awk kann float vergleichen)
+if awk -v t="$TEMP" -v c="$CRIT" 'BEGIN{exit !(t>=c)}'; then
+  echo "CRITICAL - CPU temp ${TEMP}C | temp=${TEMP};${WARN};${CRIT}"
   exit 2
-elif (( $(echo "$TEMP >= $WARN" | bc -l) )); then
-  echo "WARNING - CPU temp ${TEMP}°C | temp=${TEMP};$WARN;$CRIT"
+elif awk -v t="$TEMP" -v w="$WARN" 'BEGIN{exit !(t>=w)}'; then
+  echo "WARNING - CPU temp ${TEMP}C | temp=${TEMP};${WARN};${CRIT}"
   exit 1
 else
-  echo "OK - CPU temp ${TEMP}°C | temp=${TEMP};$WARN;$CRIT"
+  echo "OK - CPU temp ${TEMP}C | temp=${TEMP};${WARN};${CRIT}"
   exit 0
 fi
 EOF
