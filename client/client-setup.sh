@@ -114,6 +114,30 @@ sudo chmod +x /opt/ncpa-src/agent/plugins/check_apt
 echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
+sudo tee ${NCPA_PLUGINS}/check_cpu_temp << 'EOF'
+#!/usr/bin/env bash
+
+WARN=${1:-75}
+CRIT=${2:-85}
+
+FILE="/sys/class/thermal/thermal_zone0/temp"
+
+[ ! -r "$FILE" ] && echo "UNKNOWN - CPU temp not readable" && exit 3
+
+TEMP=$(awk '{print $1/1000}' "$FILE")
+
+if (( $(echo "$TEMP >= $CRIT" | bc -l) )); then
+  echo "CRITICAL - CPU temp ${TEMP}°C | temp=${TEMP};$WARN;$CRIT"
+  exit 2
+elif (( $(echo "$TEMP >= $WARN" | bc -l) )); then
+  echo "WARNING - CPU temp ${TEMP}°C | temp=${TEMP};$WARN;$CRIT"
+  exit 1
+else
+  echo "OK - CPU temp ${TEMP}°C | temp=${TEMP};$WARN;$CRIT"
+  exit 0
+fi
+EOF
+
 sudo tee ${NCPA_PLUGINS}/check_apt_list >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -496,9 +520,8 @@ sudo chmod 0755 \
   "${NCPA_PLUGINS}/check_ssl_cert_expiry" \
   "${NCPA_PLUGINS}/run_apt_update" \
   "${NCPA_PLUGINS}/check_docker_swarm_services" \
+  "${NCPA_PLUGINS}/check_cpu_temp" \
   "${NCPA_PLUGINS}/check_apt_list"
-
-
 
 echo "[*] Creating/patching systemd unit ${SERVICE_FILE} ..."
 sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
