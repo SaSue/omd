@@ -130,11 +130,19 @@ done
 
 temp_c=""
 
-# 1) Raspberry Pi: sysfs ist die zuverlässigste Quelle (milli°C)
+# 1) sysfs nur verwenden, wenn thermal_zone0 wirklich CPU ist
 if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
-  raw="$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true)"
-  if [[ "$raw" =~ ^[0-9]+$ ]]; then
-    temp_c=$(( raw / 1000 ))
+  ztype=""
+  if [[ -r /sys/class/thermal/thermal_zone0/type ]]; then
+    ztype="$(cat /sys/class/thermal/thermal_zone0/type 2>/dev/null || true)"
+  fi
+
+  # Nur CPU-ähnliche Typen akzeptieren
+  if echo "$ztype" | grep -Eqi '(cpu|x86_pkg_temp|cpu-thermal|soc|processor)'; then
+    raw="$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true)"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+      temp_c=$(( raw / 1000 ))
+    fi
   fi
 fi
 
@@ -146,15 +154,12 @@ if [[ -z "$temp_c" ]] && command -v sensors >/dev/null 2>&1; then
       gsub(/°C/,"",x);
       return x;
     }
-    BEGIN {
-      best="";
-      bestprio=999;
-    }
+    BEGIN { best=""; bestprio=999; chip=""; }
 
     # Block-Header (Chipname)
-    /^[a-zA-Z0-9_.-]+-[a-zA-Z0-9_.-]+-[0-9]+$/ { chip=$1 }
+    /^[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-[0-9]+$/ { chip=$1 }
 
-    # AMD: Tctl (häufig beste CPU-Temp)
+    # AMD: Tctl
     /Tctl:/ {
       v=clean($2);
       if (v+0 > -50 && v+0 < 200) {
@@ -163,7 +168,7 @@ if [[ -z "$temp_c" ]] && command -v sensors >/dev/null 2>&1; then
       }
     }
 
-    # Intel coretemp: Package id 0 (beste Wahl)
+    # Intel coretemp: Package id 0
     /Package id [0-9]+:/ {
       v=clean($4);
       if (v+0 > -50 && v+0 < 200) {
@@ -182,8 +187,8 @@ if [[ -z "$temp_c" ]] && command -v sensors >/dev/null 2>&1; then
       }
     }
 
-    # AppleSMC: TC0C/TC0P (CPU die/proximity), aber keine -127 / -52
-    /^TC0[CPEF]:/ || /^TC[0-9]C:/ {
+    # AppleSMC: TC* Sensoren (nur plausible)
+    /^TC[0-9A-Z]{2,3}:/ {
       v=clean($2);
       if (v+0 > -50 && v+0 < 200) {
         prio=3;
@@ -192,7 +197,7 @@ if [[ -z "$temp_c" ]] && command -v sensors >/dev/null 2>&1; then
       }
     }
 
-    # Generic temp1: aber BAT/ACPI & offensichtliche Quatschwerte ignorieren
+    # Generic temp1: aber BAT/ACPI ignorieren
     /^temp1:/ {
       if (chip ~ /BAT|acpi/i) next;
       v=clean($2);
@@ -203,16 +208,13 @@ if [[ -z "$temp_c" ]] && command -v sensors >/dev/null 2>&1; then
     }
 
     END {
-      if (best != "") {
-        # integer rounding
-        printf "%d\n", int(best+0.5);
-      }
+      if (best != "") printf "%d\n", int(best+0.5);
     }
   ')"
 fi
 
 if [[ -z "${temp_c:-}" ]]; then
-  echo "UNKNOWN - no CPU temperature found (no sysfs and no usable sensors output)"
+  echo "UNKNOWN - no CPU temperature found (no usable sysfs CPU zone and no usable sensors output)"
   exit 3
 fi
 
