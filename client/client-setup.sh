@@ -128,64 +128,106 @@ while getopts "w:c:" o; do
   esac
 done
 
-TEMP=""
+temp_c=""
 
-# 0) Raspberry Pi: sysfs (milli°C)
+# 1) Raspberry Pi: sysfs ist die zuverlässigste Quelle (milli°C)
 if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
-  raw="$(cat /sys/class/thermal/thermal_zone0/temp || true)"
+  raw="$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true)"
   if [[ "$raw" =~ ^[0-9]+$ ]]; then
-    # integer °C
-    TEMP=$(( raw / 1000 ))
+    temp_c=$(( raw / 1000 ))
   fi
 fi
 
-# 1) Intel/AMD: coretemp Package id 0
-if [[ -z "$TEMP" ]] && command -v sensors >/dev/null 2>&1; then
-  TEMP="$(sensors 2>/dev/null | awk '
-/coretemp/ { core=1 }
-core && /Package id 0:/ {
-  gsub(/[+°C]/,"",$4); print int($4); exit
-}
-')"
+# 2) Linux (Ubuntu/PC): sensors -> bevorzugt coretemp (Package/Tctl/Core), BAT/ACPI ignorieren
+if [[ -z "$temp_c" ]] && command -v sensors >/dev/null 2>&1; then
+  temp_c="$(sensors 2>/dev/null | awk '
+    function clean(x) {
+      gsub(/^[+]/,"",x);
+      gsub(/°C/,"",x);
+      return x;
+    }
+    BEGIN {
+      best="";
+      bestprio=999;
+    }
+
+    # Block-Header (Chipname)
+    /^[a-zA-Z0-9_.-]+-[a-zA-Z0-9_.-]+-[0-9]+$/ { chip=$1 }
+
+    # AMD: Tctl (häufig beste CPU-Temp)
+    /Tctl:/ {
+      v=clean($2);
+      if (v+0 > -50 && v+0 < 200) {
+        prio=1;
+        if (best=="" || prio < bestprio) { best=v; bestprio=prio; }
+      }
+    }
+
+    # Intel coretemp: Package id 0 (beste Wahl)
+    /Package id [0-9]+:/ {
+      v=clean($4);
+      if (v+0 > -50 && v+0 < 200) {
+        prio=1;
+        if (best=="" || prio < bestprio) { best=v; bestprio=prio; }
+      }
+    }
+
+    # Intel coretemp: Core X (Fallback) -> nimm Maximum der Cores
+    /Core [0-9]+:/ {
+      v=clean($3);
+      if (v+0 > -50 && v+0 < 200) {
+        prio=2;
+        if (best=="" || prio < bestprio) { best=v; bestprio=prio; }
+        else if (prio == bestprio && (v+0) > (best+0)) { best=v; }
+      }
+    }
+
+    # AppleSMC: TC0C/TC0P (CPU die/proximity), aber keine -127 / -52
+    /^TC0[CPEF]:/ || /^TC[0-9]C:/ {
+      v=clean($2);
+      if (v+0 > -50 && v+0 < 200) {
+        prio=3;
+        if (best=="" || prio < bestprio) { best=v; bestprio=prio; }
+        else if (prio == bestprio && (v+0) > (best+0)) { best=v; }
+      }
+    }
+
+    # Generic temp1: aber BAT/ACPI & offensichtliche Quatschwerte ignorieren
+    /^temp1:/ {
+      if (chip ~ /BAT|acpi/i) next;
+      v=clean($2);
+      if (v+0 > -50 && v+0 < 200) {
+        prio=4;
+        if (best=="" || prio < bestprio) { best=v; bestprio=prio; }
+      }
+    }
+
+    END {
+      if (best != "") {
+        # integer rounding
+        printf "%d\n", int(best+0.5);
+      }
+    }
+  ')"
 fi
 
-# 2) Apple SMC fallback
-if [[ -z "$TEMP" ]] && command -v sensors >/dev/null 2>&1; then
-  TEMP="$(sensors 2>/dev/null | awk '
-/applesmc/ { smc=1 }
-smc && /^TC0C:/ {
-  gsub(/[+°C]/,"",$2); print int($2); exit
-}
-')"
-fi
-
-# 3) Generic fallback
-if [[ -z "$TEMP" ]] && command -v sensors >/dev/null 2>&1; then
-  TEMP="$(sensors 2>/dev/null | awk '
-/temp1:/ {
-  gsub(/[+°C]/,"",$2); print int($2); exit
-}
-')"
-fi
-
-if [[ -z "${TEMP:-}" ]]; then
-  echo "UNKNOWN - no CPU temperature sensor found"
+if [[ -z "${temp_c:-}" ]]; then
+  echo "UNKNOWN - no CPU temperature found (no sysfs and no usable sensors output)"
   exit 3
 fi
 
-STATUS="OK"
-RC=0
-
-if (( TEMP >= CRIT )); then
-  STATUS="CRITICAL"
-  RC=2
-elif (( TEMP >= WARN )); then
-  STATUS="WARNING"
-  RC=1
+rc=0
+state="OK"
+if (( temp_c >= CRIT )); then
+  rc=2
+  state="CRITICAL"
+elif (( temp_c >= WARN )); then
+  rc=1
+  state="WARNING"
 fi
 
-echo "$STATUS - CPU temp ${TEMP}°C | temp=${TEMP};${WARN};${CRIT}"
-exit $RC
+echo "$state - CPU temp ${temp_c}°C | temp=${temp_c};${WARN};${CRIT}"
+exit "$rc"
 EOF
 
 sudo tee ${NCPA_PLUGINS}/check_apt_list >/dev/null <<'EOF'
