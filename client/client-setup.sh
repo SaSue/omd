@@ -115,7 +115,7 @@ echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
 sudo tee ${NCPA_PLUGINS}/check_cpu_temp << 'EOF'
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 WARN=75
