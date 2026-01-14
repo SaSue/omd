@@ -115,33 +115,64 @@ echo "[*] Installing docker plugins into ${NCPA_PLUGINS} ..."
 sudo install -d -m 0755 "${NCPA_PLUGINS}"
 
 sudo tee ${NCPA_PLUGINS}/check_cpu_temp << 'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-WARN="${1:-75}"
-CRIT="${2:-85}"
-FILE="/sys/class/thermal/thermal_zone0/temp"
+WARN=75
+CRIT=85
 
-if [[ ! -r "$FILE" ]]; then
-  echo "UNKNOWN - CPU temp not readable ($FILE)"
+while getopts "w:c:" o; do
+  case "$o" in
+    w) WARN="$OPTARG" ;;
+    c) CRIT="$OPTARG" ;;
+  esac
+done
+
+# 1️⃣ coretemp (Intel / AMD)
+TEMP=$(sensors 2>/dev/null | awk '
+/coretemp/ { core=1 }
+core && /Package id 0:/ {
+  gsub(/[+°C]/,"",$4); print $4; exit
+}
+')
+
+# 2️⃣ fallback: CPU Core temp (Apple SMC)
+if [[ -z "${TEMP:-}" ]]; then
+  TEMP=$(sensors 2>/dev/null | awk '
+/applesmc/ { smc=1 }
+smc && /^TC0C:/ {
+  gsub(/[+°C]/,"",$2); print $2; exit
+}
+')
+fi
+
+# 3️⃣ letzter Fallback (NOT ideal)
+if [[ -z "${TEMP:-}" ]]; then
+  TEMP=$(sensors 2>/dev/null | awk '
+/temp1:/ {
+  gsub(/[+°C]/,"",$2); print $2; exit
+}
+')
+fi
+
+if [[ -z "${TEMP:-}" ]]; then
+  echo "UNKNOWN - no CPU temperature sensor found"
   exit 3
 fi
 
-# Milligrad -> Grad (immer mit Punkt als Dezimaltrenner)
-RAW="$(cat "$FILE")"
-TEMP="$(awk -v r="$RAW" 'BEGIN{printf "%.1f", r/1000}')"
+STATUS="OK"
+RC=0
 
-# Vergleiche ohne bc (awk kann float vergleichen)
-if awk -v t="$TEMP" -v c="$CRIT" 'BEGIN{exit !(t>=c)}'; then
-  echo "CRITICAL - CPU temp ${TEMP}C | temp=${TEMP};${WARN};${CRIT}"
-  exit 2
-elif awk -v t="$TEMP" -v w="$WARN" 'BEGIN{exit !(t>=w)}'; then
-  echo "WARNING - CPU temp ${TEMP}C | temp=${TEMP};${WARN};${CRIT}"
-  exit 1
-else
-  echo "OK - CPU temp ${TEMP}C | temp=${TEMP};${WARN};${CRIT}"
-  exit 0
+if (( $(echo "$TEMP >= $CRIT" | bc -l) )); then
+  STATUS="CRITICAL"
+  RC=2
+elif (( $(echo "$TEMP >= $WARN" | bc -l) )); then
+  STATUS="WARNING"
+  RC=1
 fi
+
+echo "$STATUS - CPU temp ${TEMP}°C | temp=${TEMP};${WARN};${CRIT}"
+exit $RC
 EOF
 
 sudo tee ${NCPA_PLUGINS}/check_apt_list >/dev/null <<'EOF'
