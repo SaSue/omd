@@ -276,6 +276,18 @@ run_timeout() {
   fi
 }
 
+APT_UPDATE_TIMEOUT=30
+
+run_timeout_update() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${APT_UPDATE_TIMEOUT}" "$@"
+  else
+    "$@"
+  fi
+}
+
+run_timeout_update sudo -n apt-get update -qq >/dev/null 2>&1 || true
+
 # --- collect upgradable packages ---
 # We rely on current apt cache. This script does NOT run "apt update".
 UPG_LIST="$(run_timeout bash -lc 'LANG=C apt list --upgradable 2>/dev/null | tail -n +2' || true)"
